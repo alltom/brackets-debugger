@@ -26,15 +26,23 @@
 
 define(function (require, exports, module) {
 	'use strict';
+    
+    // non-module scripts
+    require("../../../thirdparty/jshint/jshint"); // TODO: better way to describe path?
 
 	var DocumentManager = brackets.getModule("document/DocumentManager");
 	var EditorManager   = brackets.getModule("editor/EditorManager");
 	var ScriptAgent     = brackets.getModule("LiveDevelopment/Agents/ScriptAgent");
+	var Inspector       = brackets.getModule("LiveDevelopment/Inspector/Inspector");
+	var LiveDevelopment = brackets.getModule("LiveDevelopment/LiveDevelopment");
 
 	var Console    = require("Console");
 	var Debugger   = require("Debugger");
 	var Breakpoint = require("Breakpoint");
 	var Parser     = require("Parser");
+
+    // for tom
+    var InlineEditor = require("InlineEditor");
 
 	var $style;
 	var traceLineTimeouts = {};
@@ -213,12 +221,171 @@ define(function (require, exports, module) {
 		if (! editor) return;
 		editor._codeMirror.clearMarker(location.lineNumber, null, "breakpoint");
 	}
-
+    
+    var laters = [];
+    function getLater(laterId) {
+        for (var i in laters) {
+            if (laters[i].laterId === laterId) {
+                return laters[i];
+            }
+        }
+    }
+    function registerLater(callFrames) {
+        var callerFrame = callFrames[2];
+        var loc = callerFrame.location;
+        Inspector.Debugger.getScriptSource(callerFrame.location.scriptId, function (ev) {
+            // find the invocation of 'later()' in the source code so we
+            // know how much text to replace
+            var regexp = /^later(?:\s*\(\s*\)\s*;?)?/,
+                callerSource = ev.scriptSource,
+                sourceLines = callerSource.split(/\r?\n/),
+                line = sourceLines[loc.lineNumber].slice(loc.columnNumber),
+                match = regexp.exec(line);
+            
+            if (!match) {
+                console.log('warning: could not find later() in source', loc, line);
+                return;
+            }
+            
+            // get the id that was assigned to this instance of later()
+            Inspector.Debugger.evaluateOnCallFrame(callFrames[0].callFrameId, 'this.laterId', 'laters', false, true, function (ev) {
+                // create and remember the later object
+                var later = { loc: loc,
+                              endLoc: { lineNumber: loc.lineNumber, columnNumber: loc.columnNumber + match[0].length },
+                              laterId: ev.result.value };
+                laters.push(later);
+                
+                // replace later() with an anonymous function which references all
+                // the variables you might want in the closure
+                JSHINT(callerSource);
+                var vars = findVariablesInScope(JSHINT.data(),
+                                                loc.lineNumber + 1, // jshint numbers lines from 1
+                                                loc.columnNumber);
+                
+                // TODO: do the replacement
+                console.log('would add function referencing', vars, 'at', later.loc);
+                
+                // ... doc.replaceRange(...) ...
+                // ... Inspector.Debugger.setScriptSource(...) ...
+                
+                // resume, the user doesn't want to break here
+                Inspector.Debugger.resume();
+            });
+        });
+    }
+    
+    /*
+    finds the variables that are in scope at the given line/col using the
+    provided jshintData object, which you can obtain like this:
+    
+      JSHINT(src);
+      var jshintData = JSHINT.data();
+    
+    */
+    function findVariablesInScope(jshintData, line, col) {
+        var fInfo = jshintData.functions;
+    
+        // comparator for positions in the form { line: XXX, character: YYY }
+        var compare = function (pos1, pos2) {
+            var c = pos1.line - pos2.line;
+            if (c == 0) {
+                c = pos1.character - pos2.character;
+            }
+            return c;
+        };
+    
+        // finds all functions in fInfo surrounding line/col
+        var findContainingFunctions = function () {
+            var functions = [];
+            for (var i in fInfo) {
+                var startsBefore = compare({ line: fInfo[i].line, character: fInfo[i].last },
+                                           { line: line, character: col }) <= 0;
+                var endsAfter    = compare({ line: fInfo[i].last, character: fInfo[i].lastcharacter },
+                                           { line: line, character: col }) >= 0;
+                if (startsBefore && endsAfter) {
+                    functions.push(fInfo[i]);
+                }
+            }
+            return functions;
+        };
+    
+        // returns all variables that are in scope (except globals) from the given list of functions
+        var collectVars = function (functions) {
+            // add vars as keys in an object (de-dup)
+            var varsO = {};
+            for (var i in functions) {
+                var newVars = [].concat(functions[i]['closure'] || [],
+                                        functions[i]['outer'] || [],
+                                        functions[i]['var'] || [],
+                                        functions[i]['unused'] || []);
+                for (var v in newVars) {
+                    varsO[newVars[v]] = true;
+                }
+            }
+    
+            // pull them out into a sorted array
+            var vars = [];
+            for (var i in varsO) {
+                vars.push(i);
+            }
+            return vars.sort();
+        };
+    
+        return collectVars(findContainingFunctions());
+    }
+    
+	var _pausedLine;
 	function onPaused(event, res) {
 		var editor = _editorForURL(res.location.url);
-		if (! editor) { return; }
-		editor.setCursorPos(res.location.lineNumber, res.location.columnNumber);
-		editor._codeMirror.setLineClass(res.location.lineNumber, "paused");
+
+        if (!ScriptAgent.loaded()) {
+            return;
+        }
+        
+        /*
+        TODO: instead of using 'debugger;' statements in the page's source,
+              set the breakpoints from the extension and register their IDs with brackets-debugger
+              so it can dispatch the event without all this code here
+        */
+
+		var path = LiveDevelopment._urlToPath(res.location.url); // TODO
+
+        if (res.callFrames[0].functionName == 'Function.later') {
+            // we hit the breakpoint inside of later(); register this call site
+            registerLater(res.callFrames);
+        } else {
+            if (!editor) return;
+            // TODO: open an editor instead
+            
+            // check if this is the invocation of one of the functions spliced in by later()
+            // TODO: some of the calls below are asynchronous, potentially creating
+            //       a race condition if execution continues by by some other means, like through the UI
+            Inspector.Debugger.evaluateOnCallFrame(res.callFrames[0].callFrameId, 'this.laterId', 'laters', false, true, function (ev) {
+                var later = getLater(ev.result.value);
+                if (later) {
+                    // this breakpoint is at a 'later()'
+                    DocumentManager.getDocumentForPath(path).done(function (doc) {
+                        // replace the call to later() with an anonymous function definition
+                        doc.replaceRange("function () {\n    'use strict';\n    \n}",
+                                         { line: later.loc.lineNumber, ch: later.loc.columnNumber },
+                                         { line: later.endLoc.lineNumber, ch: later.endLoc.columnNumber });
+                        for (var i = 0; i < 3; i++) {
+                            editor._codeMirror.indentLine(later.loc.lineNumber + i + 1);
+                        }
+                        
+                        // put cursor on (then highlight) the blank line in the new function definition
+                        _pausedLine = later.loc.lineNumber;
+                        editor.setCursorPos(_pausedLine + 2, editor._codeMirror.getLine(_pausedLine).length);
+                        editor._codeMirror.setLineClass(_pausedLine + 2, "paused");
+                    });
+                } else {
+                    // regular breakpoint flow: just mark the line
+                    _pausedLine = res.location.lineNumber;
+                    editor.setCursorPos(_pausedLine, res.location.columnNumber);
+                    editor._codeMirror.setLineClass(_pausedLine, "paused");
+                }
+            });
+        }
 	}
 
 	function onResumed(event, res) {
@@ -288,6 +455,27 @@ define(function (require, exports, module) {
 		// 		parseDocument(doc);
 		// 	});
 		// });
+        
+        $(DocumentManager).on("currentDocumentChange documentSaved", function () {
+            var editor = EditorManager.getCurrentFullEditor();
+            if (!editor) {
+                return;
+            }
+            
+            if (!ScriptAgent.loaded()) {
+                return;
+            }
+            
+            // TODO: there's a race condition: sometimes ScriptAgent.scriptForURL throws an
+            //       exception because its internal state hasn't been initialized
+            var script = ScriptAgent.scriptForURL(editor.document.url);
+            if (script) {
+                console.log('overwriting script', script.scriptId, script.url, editor.document.getText().slice(0, 40) + '...');
+                Inspector.Debugger.setScriptSource(script.scriptId, editor.document.getText());
+            } else {
+                console.log('no script found for', editor.document.url);
+            }
+        });
 	}
 
 	// unload
